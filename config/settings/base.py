@@ -181,6 +181,10 @@ CRISPY_TEMPLATE_PACK = "bootstrap5"
 # ---------------------------------------------------------------------------
 CELERY_BROKER_URL = env("REDIS_URL", default="redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = env("REDIS_URL", default="redis://localhost:6379/0")
+# Run tasks in-process when no broker is available (set in .env by start.py for
+# local dev). Production leaves these unset, so tasks go through Redis as normal.
+CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
+CELERY_TASK_EAGER_PROPAGATES = env.bool("CELERY_TASK_EAGER_PROPAGATES", default=False)
 CELERY_TIMEZONE = TIME_ZONE
 
 # ---------------------------------------------------------------------------

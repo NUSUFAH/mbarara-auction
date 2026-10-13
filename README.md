@@ -55,6 +55,16 @@ plumbing), and Payments (status tracking only — no real gateway).
 
 ## Local setup (clone → running in minutes)
 
+### Quickest: one click (Windows / Linux / macOS)
+
+Double-click `start.bat` (Windows) or run `./start.sh`. It creates a virtual
+environment, installs dependencies, writes `.env`, migrates, loads demo data,
+starts the auction scheduler and the web server, and opens your browser. No
+PostgreSQL or Redis needed. Needs Python 3.10+.
+
+Log in at `/admin` as `seed_admin` / `Seed@12345`. Options: `--reset` (wipe the
+database), `--no-seed`, `--no-browser`, `--port 8080`.
+
 ### Option A — plain Python + local Postgres & Redis
 
 ```bash

@@ -1,293 +1,258 @@
 #!/usr/bin/env python
 """
-One-click startup script for Mbarara Auction System.
-Automatically sets up venv, installs dependencies, runs migrations, and starts the server.
+One-click startup for Mbarara Auction System.
 
-Usage:
-    python start.py          # Full setup + run server
-    python start.py --reset  # Wipe database and start fresh
-    python start.py --help   # Show options
+Double-click start.bat (Windows) or run ./start.sh (Linux/macOS). With no input
+from you it will:
+
+    1. create a virtual environment (.venv)            [first run only]
+    2. install dependencies                            [first run / when requirements change]
+    3. create a .env file with a fresh SECRET_KEY      [first run only]
+    4. run database migrations
+    5. load demo data (users, auctions, bids)          [first run only]
+    6. start the auction scheduler (activates scheduled auctions, closes ended ones)
+    7. start the web server and open your browser
+
+Options:
+    python start.py --reset        wipe the database and start fresh (re-seeds)
+    python start.py --no-seed      don't load demo data
+    python start.py --no-browser   don't open the browser
+    python start.py --no-server    set everything up, then exit
+    python start.py --port 8080    use a different port
 """
-
+import hashlib
 import os
-import sys
-import subprocess
-import platform
-import shutil
 import secrets
+import socket
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
 from pathlib import Path
 
-# Color output for better UX
-class Color:
-    GREEN = '\033[92m'
-    BLUE = '\033[94m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    RESET = '\033[0m'
+ROOT = Path(__file__).resolve().parent
+os.chdir(ROOT)
 
-def print_step(msg):
-    print(f"{Color.BLUE}→ {msg}{Color.RESET}")
+# Windows consoles default to a legacy code page that can't print the symbols below.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.platform == "win32":
+    os.system("")  # enables ANSI colour codes in cmd.exe / PowerShell
 
-def print_success(msg):
-    print(f"{Color.GREEN}✓ {msg}{Color.RESET}")
+SEED_USER = "seed_admin"
+SEED_PASSWORD = "Seed@12345"
+SCHEDULER_INTERVAL_SECONDS = 30
+MIN_PYTHON = (3, 10)  # Django 5.2 / crispy-bootstrap5 2026.x need 3.10+
 
-def print_warning(msg):
-    print(f"{Color.YELLOW}⚠ {msg}{Color.RESET}")
+VENV = ROOT / ".venv"
+VENV_PYTHON = VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
 
-def print_error(msg):
-    print(f"{Color.RED}✗ {msg}{Color.RESET}")
+
+class C:
+    GREEN, BLUE, YELLOW, RED, RESET = "\033[92m", "\033[94m", "\033[93m", "\033[91m", "\033[0m"
+
+
+def step(msg): print(f"{C.BLUE}→ {msg}{C.RESET}", flush=True)
+def ok(msg): print(f"{C.GREEN}✓ {msg}{C.RESET}", flush=True)
+def warn(msg): print(f"{C.YELLOW}⚠ {msg}{C.RESET}", flush=True)
+
+
+def fail(msg):
+    print(f"{C.RED}✗ {msg}{C.RESET}", flush=True)
     sys.exit(1)
 
-def run_command(cmd, check=True, shell=False):
-    """Run a shell command and return success status."""
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=shell,
-            check=check,
-            cwd=os.getcwd(),
-            env=os.environ.copy()
-        )
-        return result.returncode == 0
-    except subprocess.CalledProcessError as e:
-        print_error(f"Command failed: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
-        return False
-    except FileNotFoundError:
-        return False
 
-def get_python_executable():
-    """Get the Python executable path."""
-    if sys.platform == "win32":
-        return sys.executable
-    return sys.executable
+def run(cmd, check=True, quiet=False):
+    """Run a command with the venv's interpreter environment. Returns True on success."""
+    kwargs = {"cwd": ROOT, "env": os.environ.copy()}
+    if quiet:
+        kwargs.update(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run([str(c) for c in cmd], **kwargs)
+    if check and result.returncode != 0:
+        fail(f"Command failed: {' '.join(str(c) for c in cmd)}")
+    return result.returncode == 0
 
-def get_venv_activate():
-    """Get the path to venv activate script."""
-    venv_path = Path(".venv")
-    if sys.platform == "win32":
-        return venv_path / "Scripts" / "activate.bat"
-    return venv_path / "bin" / "activate"
 
+def manage(*args, check=True, quiet=False):
+    return run([VENV_PYTHON, "manage.py", *args], check=check, quiet=quiet)
+
+
+# --------------------------------------------------------------------------- setup
 def create_venv():
-    """Create virtual environment if it doesn't exist."""
-    venv_path = Path(".venv")
-    if venv_path.exists():
-        print_success("Virtual environment already exists")
-        return True
+    if VENV_PYTHON.exists():
+        ok("Virtual environment ready")
+        return
+    step("Creating virtual environment (first run)...")
+    run([sys.executable, "-m", "venv", VENV])
+    ok("Virtual environment created")
 
-    print_step("Creating virtual environment...")
-    if not run_command([sys.executable, "-m", "venv", ".venv"]):
-        print_error("Failed to create virtual environment")
-    print_success("Virtual environment created")
-    return True
-
-def get_pip_executable():
-    """Get pip executable for the venv."""
-    venv_path = Path(".venv")
-    if sys.platform == "win32":
-        return venv_path / "Scripts" / "pip.exe"
-    return venv_path / "bin" / "pip"
 
 def install_dependencies():
-    """Install project dependencies."""
-    print_step("Installing dependencies...")
-    pip_exe = get_pip_executable()
-    
-    # Upgrade pip
-    run_command([str(pip_exe), "install", "--upgrade", "pip", "setuptools", "wheel"], check=False)
-    
-    # Install requirements-dev.txt (without psycopg2 for SQLite)
-    req_file = "requirements-dev.txt"
-    if not Path(req_file).exists():
-        req_file = "requirements.txt"
-    
-    print_step(f"Installing from {req_file}...")
-    if not run_command([str(pip_exe), "install", "-r", req_file]):
-        print_error(f"Failed to install dependencies from {req_file}")
-    print_success("Dependencies installed")
-    return True
+    req = ROOT / ("requirements-dev.txt" if (ROOT / "requirements-dev.txt").exists() else "requirements.txt")
+    digest = hashlib.sha256(req.read_bytes()).hexdigest()
+    stamp = VENV / ".requirements.sha256"
+    if stamp.exists() and stamp.read_text().strip() == digest:
+        ok("Dependencies up to date")
+        return
+    step(f"Installing dependencies from {req.name} (this can take a minute)...")
+    run([VENV_PYTHON, "-m", "pip", "install", "--quiet", "--upgrade", "pip"], check=False)
+    run([VENV_PYTHON, "-m", "pip", "install", "-r", req])
+    stamp.write_text(digest)
+    ok("Dependencies installed")
+
 
 def create_env_file():
-    """Create .env file from .env.example if it doesn't exist."""
-    env_file = Path(".env")
-    env_example = Path(".env.example")
-    
+    env_file = ROOT / ".env"
     if env_file.exists():
-        print_success(".env file already exists")
-        return True
-    
-    print_step("Creating .env configuration...")
-    secret_key = secrets.token_urlsafe(50)
-    
-    env_content = f"""DJANGO_SETTINGS_MODULE=config.settings.development
-SECRET_KEY={secret_key}
-DEBUG=True
-ALLOWED_HOSTS=localhost,127.0.0.1
+        ok(".env file found")
+        return
+    step("Creating .env configuration...")
+    env_file.write_text(
+        "DJANGO_SETTINGS_MODULE=config.settings.development\n"
+        f"SECRET_KEY={secrets.token_urlsafe(50)}\n"
+        "DEBUG=True\n"
+        "ALLOWED_HOSTS=localhost,127.0.0.1\n"
+        "\n# SQLite - no PostgreSQL needed locally\n"
+        "DATABASE_URL=sqlite:///db.sqlite3\n"
+        "CSRF_TRUSTED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000\n"
+        "\n# Emails print to this window\n"
+        "EMAIL_BACKEND=django.core.mail.backends.console.EmailBackend\n"
+        "\n# Run background tasks in-process - no Redis needed locally\n"
+        "CELERY_TASK_ALWAYS_EAGER=True\n"
+        "CELERY_TASK_EAGER_PROPAGATES=False\n"
+        "REDIS_URL=redis://localhost:6379/0\n"
+        "\nSQL_DEBUG_LEVEL=WARNING\n",
+        encoding="utf-8",
+    )
+    ok(".env created")
 
-# SQLite database (no PostgreSQL needed)
-DATABASE_URL=sqlite:///db.sqlite3
 
-CSRF_TRUSTED_ORIGINS=http://localhost:8000
+def needs_seed():
+    """True when the demo admin doesn't exist yet (fresh database)."""
+    code = (
+        "import sys; from django.contrib.auth import get_user_model as g; "
+        f"sys.exit(0 if g().objects.filter(username='{SEED_USER}').exists() else 1)"
+    )
+    return not manage("shell", "-c", code, check=False, quiet=True)
 
-# Email: console backend prints to terminal
-EMAIL_BACKEND=django.core.mail.backends.console.EmailBackend
-EMAIL_HOST=
-EMAIL_PORT=587
-EMAIL_HOST_USER=
-EMAIL_HOST_PASSWORD=
-EMAIL_USE_TLS=True
 
-# Celery: run tasks synchronously (no Redis needed for dev)
-CELERY_TASK_ALWAYS_EAGER=True
-CELERY_TASK_EAGER_PROPAGATES=True
-REDIS_URL=redis://localhost:6379/0
+def seed():
+    step("Loading demo data...")
+    manage("seed_data", "--password", SEED_PASSWORD)
 
-# Cache: use in-memory cache (fastest for dev)
-CACHE_BACKEND=locmem
-
-# Logging
-SQL_DEBUG_LEVEL=WARNING
-"""
-    
-    env_file.write_text(env_content)
-    print_success(".env file created")
-    return True
-
-def run_migrations():
-    """Run Django migrations."""
-    print_step("Running database migrations...")
-    python_exe = get_python_executable()
-    
-    if not run_command([python_exe, "manage.py", "migrate"]):
-        print_error("Failed to run migrations")
-    print_success("Migrations completed")
-    return True
-
-def create_superuser():
-    """Create superuser if it doesn't exist."""
-    print_step("Checking for superuser...")
-    python_exe = get_python_executable()
-    
-    # Check if any superuser exists
-    if run_command([python_exe, "manage.py", "shell", "-c", 
-                    "from django.contrib.auth import get_user_model; User = get_user_model(); import sys; sys.exit(0 if User.objects.filter(is_superuser=True).exists() else 1)"],
-                   check=False):
-        print_success("Superuser already exists")
-        return True
-    
-    print_step("No superuser found. Creating one...")
-    print(f"{Color.YELLOW}Enter superuser credentials:{Color.RESET}")
-    
-    username = input("Username [admin]: ").strip() or "admin"
-    email = input("Email [admin@localhost]: ").strip() or "admin@localhost"
-    password = input("Password: ").strip()
-    
-    if not password:
-        print_error("Password cannot be empty")
-    
-    create_cmd = f"""from django.contrib.auth import get_user_model; User = get_user_model(); User.objects.filter(username='{username}').delete(); User.objects.create_superuser('{username}', '{email}', '{password}')"""
-    
-    if not run_command([python_exe, "manage.py", "shell", "-c", create_cmd], check=False):
-        print_warning("Could not auto-create superuser. You can create one manually after startup.")
-        return False
-    
-    print_success(f"Superuser '{username}' created")
-    return True
 
 def reset_database():
-    """Reset database and start fresh."""
-    print_step("Resetting database...")
-    db_file = Path("db.sqlite3")
-    
-    if db_file.exists():
-        db_file.unlink()
-        print_success("Database deleted")
-    
-    run_migrations()
-    create_superuser()
-    print_success("Database reset complete")
+    step("Resetting database...")
+    for name in ("db.sqlite3", "db.sqlite3-journal"):
+        f = ROOT / name
+        if f.exists():
+            f.unlink()
+    ok("Database deleted")
 
-def run_server():
-    """Start Django development server."""
-    print_step("Starting development server...")
-    print(f"{Color.GREEN}")
-    print("="*60)
+
+# --------------------------------------------------------------------------- runtime
+def pick_port(preferred):
+    for port in range(preferred, preferred + 11):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+        warn(f"Port {port} is busy, trying the next one...")
+    fail(f"No free port found between {preferred} and {preferred + 10}")
+
+
+def scheduler_loop(stop):
+    """Stand-in for Celery beat: activate due auctions and close ended ones."""
+    while not stop.wait(SCHEDULER_INTERVAL_SECONDS):
+        for command in ("activate_scheduled_auctions", "close_ended_auctions"):
+            manage(command, check=False, quiet=True)
+
+
+def open_browser_when_ready(port):
+    for _ in range(60):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                webbrowser.open(f"http://localhost:{port}")
+                return
+        time.sleep(0.5)
+
+
+def print_banner(port, seeded):
+    print(f"\n{C.GREEN}{'=' * 60}")
     print("Mbarara Auction System is running!")
-    print("="*60)
-    print(f"Visit: {Color.BLUE}http://localhost:8000{Color.GREEN}")
-    print(f"Admin: {Color.BLUE}http://localhost:8000/admin{Color.GREEN}")
+    print("=" * 60)
+    print(f"Site:   {C.BLUE}http://localhost:{port}{C.GREEN}")
+    print(f"Admin:  {C.BLUE}http://localhost:{port}/admin{C.GREEN}")
+    if seeded:
+        print(f"Login:  {SEED_USER} / {SEED_PASSWORD}   (admin)")
+        print(f"        officer_moses, seller_agnes, bidder_john ... same password")
     print("Press CTRL+C to stop")
-    print(f"{Color.RESET}")
-    
-    python_exe = get_python_executable()
+    print(f"{'=' * 60}{C.RESET}\n", flush=True)
+
+
+def run_server(port, open_browser, seeded):
+    port = pick_port(port)
+    print_banner(port, seeded)
+    stop = threading.Event()
+    threading.Thread(target=scheduler_loop, args=(stop,), daemon=True).start()
+    if open_browser:
+        threading.Thread(target=open_browser_when_ready, args=(port,), daemon=True).start()
     try:
-        subprocess.run([python_exe, "manage.py", "runserver"], check=False)
+        manage("runserver", f"127.0.0.1:{port}", check=False)
     except KeyboardInterrupt:
-        print(f"\n{Color.YELLOW}Server stopped.{Color.RESET}")
-        sys.exit(0)
+        pass
+    finally:
+        stop.set()
+        print(f"\n{C.YELLOW}Server stopped.{C.RESET}")
+
 
 def main():
-    """Main setup and startup flow."""
-    print(f"{Color.BLUE}")
-    print("="*60)
-    print("Mbarara Auction System - Auto Setup")
-    print("="*60)
-    print(f"{Color.RESET}")
-    
-    # Handle command-line arguments
-    reset_mode = "--reset" in sys.argv
-    help_mode = "--help" in sys.argv or "-h" in sys.argv
-    
-    if help_mode:
-        print(f"""{Color.BLUE}Usage:{Color.RESET}
-    python start.py              # Full setup + run server
-    python start.py --reset      # Wipe database and start fresh
-    python start.py --help       # Show this message
-
-{Color.BLUE}What it does:{Color.RESET}
-    1. Creates virtual environment (if needed)
-    2. Installs dependencies (SQLite-compatible)
-    3. Creates .env file (if needed)
-    4. Runs database migrations
-    5. Creates superuser (if needed)
-    6. Starts development server
-
-{Color.BLUE}After startup:{Color.RESET}
-    • Visit http://localhost:8000
-    • Log in with your superuser account at http://localhost:8000/admin
-    • Press CTRL+C to stop the server
-
-{Color.BLUE}Database:{Color.RESET}
-    Uses SQLite (db.sqlite3) - no PostgreSQL required!
-        """)
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(__doc__)
         return
-    
-    # Check Python version
-    if sys.version_info < (3, 8):
-        print_error(f"Python 3.8+ required. You have {sys.version}")
-    
-    # Setup steps
+    if sys.version_info < MIN_PYTHON:
+        fail(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required; you have {sys.version.split()[0]}. "
+             "Install it from https://www.python.org/downloads/")
+
+    port = 8000
+    if "--port" in args:
+        try:
+            port = int(args[args.index("--port") + 1])
+        except (IndexError, ValueError):
+            fail("--port needs a number, e.g. --port 8080")
+
+    print(f"{C.BLUE}{'=' * 60}\nMbarara Auction System - Auto Setup\n{'=' * 60}{C.RESET}")
+
     try:
-        if not create_venv():
-            return
-        if not install_dependencies():
-            return
-        if not create_env_file():
-            return
-        
-        if reset_mode:
+        create_venv()
+        install_dependencies()
+        create_env_file()
+        if "--reset" in args:
             reset_database()
-        else:
-            if not run_migrations():
-                return
-            create_superuser()
-        
-        run_server()
+        step("Applying database migrations...")
+        manage("migrate", "--verbosity", "0")
+        ok("Database ready")
+
+        seeded = False
+        if "--no-seed" not in args and needs_seed():
+            seed()
+            seeded = True
+        elif "--no-seed" not in args:
+            ok("Demo data already loaded")
+            seeded = True
+
+        if "--no-server" in args:
+            ok("Setup complete (--no-server given, not starting the server)")
+            return
+        run_server(port, open_browser="--no-browser" not in args, seeded=seeded)
     except KeyboardInterrupt:
-        print(f"\n{Color.YELLOW}Setup cancelled.{Color.RESET}")
+        print(f"\n{C.YELLOW}Cancelled.{C.RESET}")
         sys.exit(1)
-    except Exception as e:
-        print_error(f"Unexpected error: {e}")
+
 
 if __name__ == "__main__":
     main()
