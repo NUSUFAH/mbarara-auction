@@ -116,6 +116,23 @@ Visit http://localhost:8000
 
 ---
 
+## Demo / seed data
+
+Populate a fresh database with sample users, categories, auctions in every
+lifecycle state, bids and payments:
+
+```bash
+python manage.py migrate
+python manage.py seed_data            # password defaults to Seed@12345
+python manage.py seed_data --password "YourDemoPass1!"
+```
+
+All accounts share that password: `seed_admin` (superuser), `officer_moses`,
+sellers `seller_agnes` / `seller_david` / `seller_rose` / `seller_pending`, and
+bidders `bidder_john` / `bidder_sarah` / `bidder_isaac` / `bidder_mary` /
+`bidder_emma` / `bidder_pending` / `bidder_suspended`. It is idempotent (safe to
+re-run) and refuses to run when `DEBUG=False` unless you pass `--force`.
+
 ## Running tests
 
 ```bash
